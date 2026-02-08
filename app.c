@@ -16,7 +16,6 @@
 #include "vendor/raygui-4.0/styles/dark/style_dark.h"
 
 cflat_export void *lib_new(Arena *arena, int argc, char **argv) {
-
     (void)argc;
     (void)argv;
 
@@ -29,19 +28,18 @@ cflat_export void *lib_new(Arena *arena, int argc, char **argv) {
     app->playback_volume = 1;
     app->capture_volume = 1;
     app->arena = arena;
-    app->step = exp2(1.0/12.0); 
-    app->notes[0] = 8.176;
     app->data_converter_memory = arena_push(arena, KiB(1), .clear=true);
     app->music_queue = music_queue_new(app->arena);
     app->music_queue->playing = true;
     app->capture_low_pass_filter_alpha = 0.75;
     app->capture_high_pass_filter_alpha = 0.75;
 
+    app->note_step = exp2(1.0/12.0); 
+    app->notes[0] = 8.176;
     for (usize i = 1; i < ARRAY_SIZE(app->notes); i += 1) {
-        app->notes[i] = app->notes[i-1] * app->step;
+        app->notes[i] = app->notes[i-1] * app->note_step;
     }
 
-    hanning_window_f32(FFT_SIZE, app->hanning_window, WINDOW_CREATE);
     return app;
 }
 
@@ -84,7 +82,10 @@ cflat_export void lib_enable(void *self) {
     app->bounds = (Rectangle) { .x = 0, .y = 0, .width = GetScreenWidth(), .height = GetScreenHeight() };
 
     app->fft_size = FFT_SIZE;
-    app->hop_size = FFT_SIZE / 4;
+    app->hop_size = HOP_SIZE;
+
+    hanning_window_f32(FFT_SIZE, app->analysis_window, WINDOW_CREATE);
+    hanning_window_f32(FFT_SIZE, app->synthesis_window, WINDOW_CREATE);
 
     result = ma_device_init(&app->context, &app->device_config, &app->device);
     
@@ -118,15 +119,19 @@ cflat_export void lib_enable(void *self) {
         ma_decoder_seek_to_pcm_frame(&app->decoder, music_file->cur_position);
     }
 
-    app->input_buffer = ring_buffer_new_opt(ma_get_bytes_per_frame(ma_format_f32, app->device.capture.channels), app->arena, FFT_SIZE, (RingBufferNewOpt) {
+    app->input_buffer = ring_buffer_new_opt(ma_get_bytes_per_frame(ma_format_f32, app->device.capture.channels), app->arena, KiB(16), (RingBufferNewOpt) {
         .align = cflat_alignof(uptr),
         .clear = true,
     });
 
-    app->output_buffer = ring_buffer_new_opt(ma_get_bytes_per_frame(ma_format_f32, app->device.playback.channels), app->arena, FFT_SIZE, (RingBufferNewOpt) {
+    cflat_assert(app->input_buffer != NULL);
+
+    app->output_buffer = ring_buffer_new_opt(ma_get_bytes_per_frame(ma_format_f32, app->device.playback.channels), app->arena, KiB(16), (RingBufferNewOpt) {
         .align = cflat_alignof(uptr),
         .clear = true,
     });
+    
+    cflat_assert(app->output_buffer != NULL);
 
     // Widget Bounds
 
@@ -203,7 +208,7 @@ cflat_export void lib_update(void *self) {
     Arena *arena = app->arena;
     
     c32 (*smooth_waves)[app->fft_size][CAPTURE_CHANNELS] = &app->smooth_waves;
-    c32 (*waves       )[app->fft_size][CAPTURE_CHANNELS] = &app->fft_out;
+    c32 (*waves       )[app->fft_size][CAPTURE_CHANNELS] = &app->fft_output;
     
     TempArena eventloop_arena = arena_temp_begin(arena);
     for (usize frame = 0; frame < CFLAT_ROW_SIZE(*waves); frame++)
@@ -262,7 +267,7 @@ void draw_playlist(WPlaylist *widget) {
     }
 
     TempArena temp;
-    arena_scratch_scope(temp, app->arena) {
+    arena_scratch_scope(temp, 1, &app->arena) {
         CStringSlice music_names = music_queue_get_names_as_cstr(temp.arena, app->music_queue);
 
         (void)GuiListViewEx(playlist_bounds, slice_data(music_names), slice_length(music_names), &playlist_scroll_index, &playlist_active_index, &playlist_focus_index);       
@@ -372,10 +377,41 @@ bool draw_playlist_buttons(WPlaylistButtons *widget) {
         .direction = DOWN,
     );
 
+    Rectangle pitch_shift_slider = next_rect(
+        capture_low_pass_filter,
+        .direction = DOWN,
+    );
+
+    Rectangle dec_shift_button = next_rect(
+        pitch_shift_slider,
+        .width = .25f,
+        .direction = LEFT,
+    );
+
+    Rectangle inc_shift_button = next_rect(
+        pitch_shift_slider,
+        .width = .25f,
+        .direction = RIGHT,
+    );
+
+    Rectangle pitch_shift_label = next_rect(
+        pitch_shift_slider,
+        .direction = DOWN,
+    );
+
     GuiSlider(capture_gain, TextFormat("Gain: %.2f", app->capture_preamp_gain), NULL, &app->capture_preamp_gain, -20, 20);
     GuiSlider(capture_low_pass_filter, TextFormat("Low Pass Filter: %.2f", app->capture_low_pass_filter_alpha), NULL, &app->capture_low_pass_filter_alpha, 0, 1);
     GuiSlider(capture_high_pass_filter, TextFormat("High Pass Filter: %.2f", app->capture_high_pass_filter_alpha), NULL, &app->capture_high_pass_filter_alpha, 0, 1);
+    GuiSlider(pitch_shift_slider, "", NULL, &app->pitch_shift_semitones, -12, 12);
 
+    DrawText(TextFormat("Transpose: %.2f", app->pitch_shift_semitones), pitch_shift_label.x, pitch_shift_label.y, 10, GetColor(GuiGetStyle(TEXT, TEXT_COLOR_NORMAL)));
+    if (GuiButton(dec_shift_button, "-")) {
+        app->pitch_shift_semitones -= 1;
+    }
+    if (GuiButton(inc_shift_button, "+")) {
+        app->pitch_shift_semitones += 1;
+    }
+    
     if (app->playlist_shuffle) {
       GuiDrawRectangle(shuffle_button, 2, GREEN, GetColor(GuiGetStyle(DEFAULT, BORDER_WIDTH)));
     }
@@ -455,7 +491,7 @@ void draw_frequencies(WFrequencySpectrum *widget) {
         f32 freq = (f32)bin/fft_size*sample_rate;
         if (freq > upper_note) break;
         if (freq < lower_note) continue;
-        f32 next_freq = freq * app->step;
+        f32 next_freq = freq * app->note_step;
         for (f32 hz = freq; hz < next_freq; hz = (f32)bin/fft_size*sample_rate) {
             if (bin >= fft_size/2) break;
             bin += 1;
@@ -475,7 +511,7 @@ void draw_frequencies(WFrequencySpectrum *widget) {
             if (freq > upper_note) break;
             if (freq < lower_note) continue;
             
-            f32 next_freq = freq * app->step;
+            f32 next_freq = freq * app->note_step;
             
             f32 db = spldB_f32((*waves)[bin][channel]);
             

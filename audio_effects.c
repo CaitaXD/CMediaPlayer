@@ -89,6 +89,9 @@ void flattop_window_f32(usize len, f32 out[len], WindowingOption clear)
     cosine_window_f32(len, out, ARRAY_SIZE(coeff), coeff, clear);
 }
 
+c32 freq_f32(f32 mag, f32 phase) {
+    return mag*cexpf(I*phase);
+}
 
 f32 spldB_f32(c32 wave) {
     return 20.0f*log10f(cabsf(wave)/20e-6);
@@ -110,9 +113,27 @@ f32 phase_f32(c32 wave) {
     return cargf(wave);
 }
 
-f32 wrap_phase_f32(f32 phase, f32 min, f32 max) {
-    f32 range = max - min;
-    return fmodf(phase + range, range) + min;
+f32 round_nearest_int_f32(f32 x) {
+    return floorf(x + 0.5f);
+}
+
+f32 pitch_ratio_from_semitones_f32(f32 semitones) {
+    return powf(2.0f, semitones/12.0f);
+}
+
+f32 wrap_2pi_f32(f32 x) {
+    f32 angle = fmodf(x, 2.0f * pi);
+    if (angle < 0) angle += 2.0f * pi;
+    return angle;
+}
+
+f32 wrap_f32(f32 x, f32 low, f32 high) {
+    if (low <= x && x < high) return x;
+
+    const f32 range = high - low;
+    const f32 inv_range = 1.0f/ range;
+    const f32 num_wraps = floorf((x - low) * inv_range);
+    return x - range * num_wraps;
 }
 
 void copy_apply_lowpass_filter_f32(usize frames, usize channels, f32 out[frames][channels], const f32 in[frames][channels], f32 alpha) {

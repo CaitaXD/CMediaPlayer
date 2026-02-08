@@ -76,7 +76,7 @@ MusicQueue *music_queue_new(Arena *arena) {
 }
 
 void music_queue_push(Arena *a, MusicQueue *queue, MusicFile music) {
-    slice_append(a, queue->playlist, music);
+    slice_append(a, &queue->playlist, music);
     queue->count += 1;
 }
 
@@ -208,10 +208,10 @@ CStringSlice music_queue_get_names_as_cstr(Arena *a, MusicQueue *queue) {
         }
         
         isize index = sv_find_last_index(name, ".");
-        if (index > 0) name = slice_take(name, index);
+        if (index > 0) name = slice_take(StringView, name, index);
 
         const char *cstr = sv_clone(a, name).data;
-        slice_append(a, result, cstr);
+        slice_append(a, &result, cstr);
     }
 
     return result;

@@ -28,8 +28,8 @@ Rectangle child_rect_opt(Rectangle current, ChildBoundsOpt opt);
 Vector2 rect_center(Rectangle rect);
 Vector2 rect_position(Rectangle rect);
 
-#define next_rect(current, ...) next_rect_opt(current, OVERRIDE_INIT(NextBoundsOpt, .width = 1, .height= 1,  __VA_ARGS__))
-#define child_rect(current, ...) child_rect_opt(current, OVERRIDE_INIT(ChildBoundsOpt, .width = 1, .height= 1, __VA_ARGS__))
+#define next_rect(current, ...) next_rect_opt(current, CFLAT_OPT(NextBoundsOpt, .width = 1, .height= 1,  __VA_ARGS__))
+#define child_rect(current, ...) child_rect_opt(current, CFLAT_OPT(ChildBoundsOpt, .width = 1, .height= 1, __VA_ARGS__))
 
 #define BOUNDS                              \
 union {                                     \

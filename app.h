@@ -42,7 +42,8 @@
 
 #define CAPTURE_SAMPLE_RATE 44100
 #define CAPTURE_CHANNELS 2
-#define FFT_SIZE (KiB(2))
+#define FFT_SIZE (KiB(1))
+#define HOP_SIZE ((FFT_SIZE) / 8)
 #define TRACE_ERROR(message, ...) TraceLog(LOG_ERROR, message "[%s:%d] %s\n",  ##__VA_ARGS__, __FILE__, __LINE__, __func__)
 
 typedef struct slice_f32 { CFLAT_SLICE_FIELDS(f32); } SliceF32;
@@ -67,54 +68,58 @@ typedef struct w_playlist_buttons {
 } WPlaylistButtons;
 
 typedef struct app_state {
-    BOUNDS;
+    /* Memory */
     Arena *arena;
-    
-    ma_context context;
-    
-    ma_device_config device_config;
-    ma_device device;
-
-    ma_decoder decoder;
-    
-    MusicQueue *music_queue;
-    
-    ma_data_converter_config data_converter_config;
-    ma_data_converter data_converter;
-    void *data_converter_memory;
-    
-    CflatRingBuffer *input_buffer;
-    CflatRingBuffer *output_buffer;
-    
-    usize fft_size;
-    usize hop_size;
-
-    c32 (smooth_waves     )[FFT_SIZE][CAPTURE_CHANNELS];
-    c32 (fft_out          )[FFT_SIZE][CAPTURE_CHANNELS];
-    c32 (fft_in           )[FFT_SIZE][CAPTURE_CHANNELS];
-    f32 (last_input_phases)[FFT_SIZE][CAPTURE_CHANNELS];
-    f32 (hanning_window   )[FFT_SIZE];
-
-    f64 step;
-    f64 notes[12*12];
-
+    /* UI */
+    BOUNDS;
+    Color background_color;
     WFrequencySpectrum w_frequency_spectrum;
     WPlaylist w_playlist;
     WPlaylistButtons w_playlist_buttons;
-
+    /* Syncronization */
     _Atomic(i32) atomic_latch;
+    /* Audio API */
+    ma_context context;
+    ma_decoder decoder;
+    ma_device device;
+    ma_device_config device_config;
+    ma_data_converter_config data_converter_config;
+    void *data_converter_memory;
+    ma_data_converter data_converter;
+    /* Audio Effects */
+    CflatRingBuffer *input_buffer;
+    CflatRingBuffer *output_buffer;    
+    usize fft_size;
+    usize hop_size;
+    c32 smooth_waves       [FFT_SIZE][CAPTURE_CHANNELS];
+    c32 fft_output            [FFT_SIZE][CAPTURE_CHANNELS];
+    c32 fft_input             [FFT_SIZE][CAPTURE_CHANNELS];
+    f32 analysis_window    [FFT_SIZE];
+    f32 synthesis_window   [FFT_SIZE];
 
+    f32 last_input_phases  [FFT_SIZE][CAPTURE_CHANNELS];
+    f32 last_output_phases [FFT_SIZE][CAPTURE_CHANNELS];
+    
+    f32 analysis_magnitudes  [FFT_SIZE/2 + 1][CAPTURE_CHANNELS];
+    f32 analysis_frequencies [FFT_SIZE/2 + 1][CAPTURE_CHANNELS];
+    f32 synthesis_magnitudes [FFT_SIZE/2 + 1][CAPTURE_CHANNELS];
+    f32 synthesis_frequencies[FFT_SIZE/2 + 1][CAPTURE_CHANNELS];
+
+    /* Audio Effect Parameters */
     f32 master_volume;
     f32 playback_volume;
     f32 capture_volume;
-
-    Color background_color;
-    bool playlist_wrap;
-    bool playlist_shuffle;
-
     f32 capture_low_pass_filter_alpha;
     f32 capture_high_pass_filter_alpha;
     f32 capture_preamp_gain;
+    f32 pitch_shift_semitones;
+    bool playlist_wrap;
+    bool playlist_shuffle;
+    /* Music */
+    MusicQueue *music_queue;
+    /* Notes */
+    f64 note_step;
+    f64 notes[12*12];
 } AppState;
 
 ma_result app_play_current_music(AppState *app);
@@ -141,10 +146,14 @@ void apply_filters(ma_device* dvc, void* buffer, const ma_uint32 frames_count) {
     carray_highpass_filter_f32(frames_count, dvc->capture.channels, buffer, app->capture_high_pass_filter_alpha);
 }
 
-void apply_block_processing(ma_device* dvc) {
+void vocoder(ma_device* dvc) {
     AppState *app = dvc->pUserData;
     CflatRingBuffer *input_buffer = app->input_buffer;
     CflatRingBuffer *output_buffer = app->output_buffer;
+    
+    cflat_assert(app != NULL);
+    cflat_assert(input_buffer != NULL);
+    cflat_assert(output_buffer != NULL);
 
     const usize frame_size = ma_get_bytes_per_frame(dvc->capture.format, dvc->capture.channels);
     const usize sample_size = ma_get_bytes_per_sample(dvc->capture.format);
@@ -153,40 +162,65 @@ void apply_block_processing(ma_device* dvc) {
     for (usize i = 0; i < app->fft_size; i += 1) {
         usize ring_index = (input_buffer->write + i - app->fft_size + input_buffer->length) % input_buffer->length;
         for (usize channel = 0; channel < channels; channel += 1) {
-            app->fft_in[i][channel] = *(f32*)PTR_ADD_BYTES(input_buffer->data, (ring_index*frame_size + channel*sample_size)) * app->hanning_window[i];
+            app->fft_input[i][channel] = *(f32*)PTR_ADD_BYTES(input_buffer->data, (ring_index*frame_size + channel*sample_size)) * app->analysis_window[i];
         }
     }
 
-    fast_fourier_transform_c32(app->fft_size, dvc->capture.channels, app->fft_in, app->fft_out);
+    fast_fourier_transform_c32(app->fft_size, dvc->capture.channels, app->fft_input, app->fft_output);
     
-    const usize bins_count = app->fft_size/2;
-    for (usize k = 0; k < bins_count; k += 1)
+    const usize analysis_bins_count = app->fft_size/2;
+    for (usize k = 0; k < analysis_bins_count; k += 1)
     for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
-        f32 mag = mag_f32(app->fft_out[k][channel]);
-        f32 phase = phase_f32(app->fft_out[k][channel]);
-        
-        f32 phse_diff = phase - app->last_input_phases[k][channel];
-        
+        f32 amplitude = mag_f32(app->fft_output[k][channel]);
+        f32 phase = phase_f32(app->fft_output[k][channel]);
+        f32 phase_delta = phase - app->last_input_phases[k][channel];
         f32 bin_center_freq = 2.0f * pi* (f32)k/ (f32)app->fft_size;
-        phse_diff = wrap_phase_f32(phse_diff - bin_center_freq * app->hop_size, -pi, pi);
-
-        f32 bin_deviation = phse_diff * (f32)app->fft_size / (f32)app->hop_size / 2.0f * pi;
-        f32 estimated_phase = phase + bin_deviation;
-
+        phase_delta = wrap_f32(phase_delta - bin_center_freq*app->hop_size, -pi, pi);
+        f32 deviation = phase_delta * (f32)app->fft_size/(f32)app->hop_size / (2.0f * pi);
+        app->analysis_frequencies[k][channel] = (f32)k + deviation;
+        app->analysis_magnitudes[k][channel] = amplitude;
         app->last_input_phases[k][channel] = phase;
+    }
 
-        (void)mag;
-        (void)phase;
-        (void)estimated_phase;
+    for (usize k = 0; k < analysis_bins_count; k += 1) 
+    for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
+        app->synthesis_magnitudes[k][channel] = app->synthesis_frequencies[k][channel] = 0;
+    }
+
+    f32 pitch_shift = pitch_ratio_from_semitones_f32(app->pitch_shift_semitones);
+    for (usize k = 0; k < analysis_bins_count; k += 1) {
+        usize new_bin = round_nearest_int_f32(k * pitch_shift);
+        if (new_bin > analysis_bins_count) continue;
+        for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
+            app->synthesis_magnitudes[new_bin][channel] += app->analysis_magnitudes[k][channel];
+            app->synthesis_frequencies[new_bin][channel] = app->analysis_frequencies[k][channel] * pitch_shift;
+        }
+    }
+
+    for (usize k = 0; k < analysis_bins_count; k += 1) 
+    for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
+        f32 amplitude = app->synthesis_magnitudes[k][channel];
+        f32 deviation = app->synthesis_frequencies[k][channel] - k;
+        f32 phase_delta = deviation * (2.0f * pi) * (f32)app->hop_size/(f32)app->fft_size;
+        f32 bin_center_freq = 2.0f * pi * (f32)k/(f32)app->fft_size;
+        phase_delta += bin_center_freq * app->hop_size;
+        f32 out_phase = wrap_f32(app->last_output_phases[k][channel] + phase_delta, -pi, pi);
+        c32 out_freq = freq_f32(amplitude, out_phase);
+        app->fft_output[k][channel] = out_freq;
+        if (k > 0 && k < analysis_bins_count) {
+            app->fft_output[app->fft_size - k][channel] = conjf(out_freq);
+        }
+        app->last_output_phases[k][channel] = out_phase;
     }
     
-    inverse_fast_fourier_transform_c32(app->fft_size, dvc->capture.channels, app->fft_out, app->fft_in);
-    carray_window_c32(app->fft_size, dvc->capture.channels, &app->fft_in, app->hanning_window);
+    inverse_fast_fourier_transform_c32(app->fft_size, dvc->capture.channels, app->fft_output, app->fft_input);
     
     for (usize i = 0; i < app->fft_size; i += 1)
     {
         usize ring_index = (output_buffer->write + i) % output_buffer->length;
-        carray_sum_c32f32(channels, (void*)(output_buffer->data + ring_index*frame_size), app->fft_in[i]);
+        for (usize channel = 0; channel < channels; channel += 1) {
+            *(f32*)PTR_ADD_BYTES(output_buffer->data, ring_index*frame_size + channel*sample_size) += app->fft_input[i][channel] * app->synthesis_window[i];
+        }
     }
 }
 
@@ -197,10 +231,11 @@ void data_callback(ma_device* dvc, void* out_buffer, const void* in_buffer, cons
 
     AppState *app = dvc->pUserData;
     const usize frame_size = ma_get_bytes_per_frame(dvc->playback.format, dvc->playback.channels);
+    const usize sample_size = ma_get_bytes_per_sample(dvc->playback.format);
     
     static usize s_hop_counter = 0;
     
-    //f32 hops_per_window = (f32)hop_size / (f32)app->fft_size;
+    //f32 hops_per_window = (f32)app->hop_size / (f32)app->fft_size;
 
     for (usize i = 0; i < frames_count; i += 1) {
         const void *in = PTR_ADD_BYTES(in_buffer, i*frame_size);
@@ -208,11 +243,14 @@ void data_callback(ma_device* dvc, void* out_buffer, const void* in_buffer, cons
         
         (ring_buffer_overwrite)(frame_size, app->input_buffer, in);
         (ring_buffer_read)(frame_size, app->output_buffer, out, (RingBufferReadOpt) { .clear = true });
-        //carray_scale_f32(channels, PTR_ADD_BYTES(out_buffer, i*frame_size), hops_per_window);
+
+        //for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
+        //    *(f32*)PTR_ADD_BYTES(out_buffer, i*frame_size + channel*sample_size) *= hops_per_window;
+        //}
 
         if (++s_hop_counter >= app->hop_size) {
             s_hop_counter = 0;
-            apply_block_processing(dvc);
+            vocoder(dvc);
             app->output_buffer->write = (app->output_buffer->write + app->hop_size) % app->output_buffer->length;
         }
     }
@@ -237,7 +275,7 @@ void play_file_data_callback(ma_device* dvc, void* out, const void* in, const ma
     result = ma_data_converter_get_required_input_frame_count(data_converter, frames_count, &required_input_frames);
 
     TempArena callback_arena;
-    arena_scratch_scope(callback_arena, app->arena) {
+    arena_scratch_scope(callback_arena, 1, &app->arena) {
         Arena *arena = callback_arena.arena;
         
         void* decoder_frames = arena_push(arena, required_input_frames*output_frame_size, .clear = true);
