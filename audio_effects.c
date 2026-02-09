@@ -10,7 +10,7 @@ cflat_enum(WindowingOption, u8) {
 };
 
 
-c32* carray_assign_f32c32(const usize size, c32 array[size], const f32 in[size]) {
+c32* carray_copy_f32_to_c32(const usize size, c32 array[size], const f32 in[size]) {
     for (usize i = 0; i < size; i += 1) array[i] = in[i];
     return array;
 }
@@ -32,24 +32,27 @@ void carray_add_scaled_f32(const usize size, f32 (*restrict out)[size], const f3
     for (usize i = 0; i < size; i += 1) (*out)[i] += (*in)[i] * scale;
 }
 
-void carray_lowpass_filter_f32(usize frames, usize channels, f32 array[frames][channels], f32 alpha) {
-    for (usize channel = 0; channel < channels; channel += 1) array[0][channel] = alpha * array[0][channel];
+void carray_lowpass_filter_f32(usize frames, usize channels, f32 out[frames][channels], f32 alpha, f32 prev_out[channels]) {
+    for (usize channel = 0; channel < channels; channel += 1) out[0][channel] = alpha * out[0][channel];
     
-    for (usize i = 1; i < frames; i += 1)
-    for (usize channel = 0; channel < channels; channel += 1) {
-        f32 x   = array[i][channel];
-        f32 ym1 = array[i-1][channel];
-        array[i][channel] = ym1 + alpha * (x - ym1);
+    for (usize i = 0; i < frames; i += 1)
+    for (usize c = 0; c < channels; c += 1) {
+        f32 x   = out[i][c];
+        f32 ym1 = prev_out[c];
+        prev_out[c] = out[i][c] = ym1 + alpha * (x - ym1);
     }
 }
 
-void carray_highpass_filter_f32(usize frames, usize channels, f32 array[frames][channels], f32 alpha) {
-    for (usize i = 1; i < frames; i += 1)
-    for (usize channel = 0; channel < channels; channel += 1) {
-        f32 x   = array[i][channel];
-        f32 xm1 = array[i-1][channel];
-        f32 ym1 = array[i-1][channel];
-        array[i][channel] = alpha * (ym1 + x - xm1);
+void carray_highpass_filter_f32(usize frames, usize channels, f32 out[frames][channels], f32 alpha, f32 prev_in[channels], f32 prev_out[channels]) {
+
+    for (usize i = 0; i < frames; i += 1)
+    for (usize c = 0; c < channels; c += 1) {
+        f32 x   = out[i][c];
+        f32 xm1 = prev_in[c];
+        f32 ym1 = prev_out[c];
+        f32 y = alpha * (ym1 + x - xm1);
+        prev_in[c] = x;
+        prev_out[c] = out[i][c] = y;
     }
 }
 
@@ -156,27 +159,5 @@ void copy_apply_lowpass_filter_f32(usize frames, usize channels, f32 out[frames]
         f32 x   = in[i][channel];
         f32 ym1 = out[i-1][channel];
         out[i][channel] = ym1 + alpha * (x - ym1);
-    }
-}
-
-void copy_apply_highpass_filter_f32(usize frames, usize channels, f32 out[frames][channels], const f32 in[frames][channels], f32 alpha) {
-    for (usize channel = 0; channel < channels; channel += 1)
-        out[0][channel] = in[0][channel];
-    
-    for (usize i = 1; i < frames; i += 1)
-    for (usize channel = 0; channel < channels; channel += 1) {
-        f32 x   = in[i][channel];
-        f32 xm1 = in[i-1][channel];
-        f32 ym1 = out[i-1][channel];
-        out[i][channel] = alpha * (ym1 + x - xm1);
-    }
-}
-
-void copy_lerpbuffer_f32(usize frames, usize channels, f32 out[frames][channels], const f32 in[frames][channels], f32 t) {
-    for (usize i = 0; i < frames; i += 1)
-    for (usize channel = 0; channel < channels; channel += 1) {
-        f32 a = out[i][channel];
-        f32 b = in[i][channel];
-        out[i][channel] = a + (b - a) * t;
     }
 }

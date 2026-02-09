@@ -110,6 +110,11 @@ typedef struct app_state {
     /* Audio Effects */
     PhaseVocoder music_queue_vocoder;
     PhaseVocoder capture_vocoder;
+    struct {
+        f32 low_pass_filter_xm1[CHANNELS];
+        f32 high_pass_filter_xm1[CHANNELS];
+        f32 high_pass_filter_ym1[CHANNELS];
+    } capture_filters;
     /* Audio Effect Parameters */
     f32 master_volume;
     f32 music_volume;
@@ -148,8 +153,8 @@ void capture_filters(ma_device* dvc, void* buffer, const ma_uint32 frames_count)
     AppState *app = dvc->pUserData;
     f32 linear_gain = dB_to_linear_f32(app->capture_preamp_gain);
     carray_scale_f32(frames_count*dvc->capture.channels, buffer,    app->capture_volume * (1.0f + linear_gain));
-    carray_lowpass_filter_f32 (frames_count, dvc->capture.channels, buffer, app->capture_low_pass_filter_alpha);
-    carray_highpass_filter_f32(frames_count, dvc->capture.channels, buffer, app->capture_high_pass_filter_alpha);
+    carray_lowpass_filter_f32 (frames_count, dvc->capture.channels, buffer, app->capture_low_pass_filter_alpha, app->capture_filters.low_pass_filter_xm1);
+    carray_highpass_filter_f32(frames_count, dvc->capture.channels, buffer, app->capture_high_pass_filter_alpha, app->capture_filters.high_pass_filter_xm1, app->capture_filters.high_pass_filter_ym1);
 }
 
 void phase_vocoder_analyse(PhaseVocoder *vocoder) {
@@ -327,7 +332,7 @@ void app_poll_capture_device_f32(AppState *app, const ma_uint32 frames_count, co
         void *top = app->capture_vocoder.input_buffer->data + app->capture_vocoder.input_buffer->write*frame_size;
         ring_buffer_overwrite(app->capture_vocoder.input_buffer, frame_size, in_buffer[i]);
         capture_filters(dvc, top, 1);
-        
+
         f32 out[channels];
         ring_buffer_read(app->capture_vocoder.output_buffer, frame_size, out, .clear = true);
         carray_add_scaled_f32(channels, &out_buffer[i], &out, 1.0 / HOPS_PER_WINDOW);
