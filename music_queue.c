@@ -81,7 +81,7 @@ void music_queue_push(Arena *a, MusicQueue *queue, MusicFile music) {
 }
 
 void music_queue_remove_at(MusicQueue *queue, usize index) {
-    cflat_bounds_check(index, slice_length(queue->playlist));
+    (void)cflat_bounds_check(index, slice_length(queue->playlist));
     memmove(&slice_data(queue->playlist)[index], &slice_data(queue->playlist)[index + 1], (slice_length(queue->playlist) - index - 1)*sizeof(MusicFile));
     
     slice_length(queue->playlist) -= 1;

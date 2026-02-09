@@ -1,4 +1,5 @@
 #define CFLAT_IMPLEMENTATION
+#include "vendor/Cflat/src/CflatMath.h"
 #include "vendor/Cflat/src/CflatBit.h"
 #include "vendor/Cflat/src/CflatCore.h"
 #include "vendor/Cflat/src/CflatArena.h"
@@ -41,13 +42,33 @@
 #include "audio_effects.c"
 
 #define CAPTURE_SAMPLE_RATE 44100
-#define CAPTURE_CHANNELS 2
+#define CHANNELS 2
 #define FFT_SIZE (KiB(1))
 #define HOP_SIZE ((FFT_SIZE) / 8)
+#define FFT_BINS (FFT_SIZE/2)
+#define HOPS_PER_WINDOW ((f64)HOP_SIZE/(f64)FFT_SIZE)
 #define TRACE_ERROR(message, ...) TraceLog(LOG_ERROR, message "[%s:%d] %s\n",  ##__VA_ARGS__, __FILE__, __LINE__, __func__)
 
 typedef struct slice_f32 { CFLAT_SLICE_FIELDS(f32); } SliceF32;
 typedef struct slice_c32 { CFLAT_SLICE_FIELDS(c32); } SliceC32;
+
+typedef struct phase_vocoder {
+    CflatRingBuffer *input_buffer;
+    CflatRingBuffer *output_buffer;    
+    f32 analysis_window       [FFT_SIZE    ];
+    f32 synthesis_window      [FFT_SIZE    ];
+    c32 fft_output            [FFT_SIZE    ][CHANNELS];
+    c32 fft_input             [FFT_SIZE    ][CHANNELS];
+    f32 last_input_phases     [FFT_SIZE    ][CHANNELS];
+    f32 last_output_phases    [FFT_SIZE    ][CHANNELS];
+    c32 smooth_waves          [FFT_SIZE    ][CHANNELS];
+    f32 analysis_magnitudes   [FFT_BINS + 1][CHANNELS];
+    f32 analysis_frequencies  [FFT_BINS + 1][CHANNELS];
+    f32 synthesis_magnitudes  [FFT_BINS + 1][CHANNELS];
+    f32 synthesis_frequencies [FFT_BINS + 1][CHANNELS];
+    ma_format format;
+    ma_uint32 channels;
+} PhaseVocoder;
 
 typedef struct w_frequency_spectrum {
     BOUNDS;
@@ -55,7 +76,6 @@ typedef struct w_frequency_spectrum {
     f32 lower_note, upper_note;
     f32 sample_rate;
     usize fft_size, channels;
-    void *waves;
 } WFrequencySpectrum;
 
 typedef struct w_playlist {
@@ -76,6 +96,7 @@ typedef struct app_state {
     WFrequencySpectrum w_frequency_spectrum;
     WPlaylist w_playlist;
     WPlaylistButtons w_playlist_buttons;
+    c32 display_waves[FFT_SIZE][CHANNELS];
     /* Syncronization */
     _Atomic(i32) atomic_latch;
     /* Audio API */
@@ -87,27 +108,11 @@ typedef struct app_state {
     void *data_converter_memory;
     ma_data_converter data_converter;
     /* Audio Effects */
-    CflatRingBuffer *input_buffer;
-    CflatRingBuffer *output_buffer;    
-    usize fft_size;
-    usize hop_size;
-    c32 smooth_waves       [FFT_SIZE][CAPTURE_CHANNELS];
-    c32 fft_output            [FFT_SIZE][CAPTURE_CHANNELS];
-    c32 fft_input             [FFT_SIZE][CAPTURE_CHANNELS];
-    f32 analysis_window    [FFT_SIZE];
-    f32 synthesis_window   [FFT_SIZE];
-
-    f32 last_input_phases  [FFT_SIZE][CAPTURE_CHANNELS];
-    f32 last_output_phases [FFT_SIZE][CAPTURE_CHANNELS];
-    
-    f32 analysis_magnitudes  [FFT_SIZE/2 + 1][CAPTURE_CHANNELS];
-    f32 analysis_frequencies [FFT_SIZE/2 + 1][CAPTURE_CHANNELS];
-    f32 synthesis_magnitudes [FFT_SIZE/2 + 1][CAPTURE_CHANNELS];
-    f32 synthesis_frequencies[FFT_SIZE/2 + 1][CAPTURE_CHANNELS];
-
+    PhaseVocoder music_queue_vocoder;
+    PhaseVocoder capture_vocoder;
     /* Audio Effect Parameters */
     f32 master_volume;
-    f32 playback_volume;
+    f32 music_volume;
     f32 capture_volume;
     f32 capture_low_pass_filter_alpha;
     f32 capture_high_pass_filter_alpha;
@@ -139,128 +144,127 @@ ma_result on_context_uninit(ma_context *ctx) {
 
 #define PTR_ADD_BYTES(X, N) ((byte*)(X) + (N))
 
-void apply_filters(ma_device* dvc, void* buffer, const ma_uint32 frames_count) {
+void capture_filters(ma_device* dvc, void* buffer, const ma_uint32 frames_count) {
     AppState *app = dvc->pUserData;
-    carray_scale_f32(frames_count*dvc->capture.channels, buffer, app->capture_volume*app->master_volume + gain_to_volume_f32(app->capture_preamp_gain));
+    f32 linear_gain = dB_to_linear_f32(app->capture_preamp_gain);
+    carray_scale_f32(frames_count*dvc->capture.channels, buffer,    app->capture_volume * (1.0f + linear_gain));
     carray_lowpass_filter_f32 (frames_count, dvc->capture.channels, buffer, app->capture_low_pass_filter_alpha);
     carray_highpass_filter_f32(frames_count, dvc->capture.channels, buffer, app->capture_high_pass_filter_alpha);
 }
 
-void vocoder(ma_device* dvc) {
-    AppState *app = dvc->pUserData;
-    CflatRingBuffer *input_buffer = app->input_buffer;
-    CflatRingBuffer *output_buffer = app->output_buffer;
-    
-    cflat_assert(app != NULL);
-    cflat_assert(input_buffer != NULL);
-    cflat_assert(output_buffer != NULL);
+void phase_vocoder_analyse(PhaseVocoder *vocoder) {
+    const CflatRingBuffer *input_buffer = vocoder->input_buffer;
 
-    const usize frame_size = ma_get_bytes_per_frame(dvc->capture.format, dvc->capture.channels);
-    const usize sample_size = ma_get_bytes_per_sample(dvc->capture.format);
-    const usize channels = dvc->capture.channels;
+    const usize frame_size = ma_get_bytes_per_frame(vocoder->format, vocoder->channels);
+    const usize sample_size = ma_get_bytes_per_sample(vocoder->format);
+    const usize channels = vocoder->channels;
 
-    for (usize i = 0; i < app->fft_size; i += 1) {
-        usize ring_index = (input_buffer->write + i - app->fft_size + input_buffer->length) % input_buffer->length;
+    for (usize i = 0; i < FFT_SIZE; i += 1) {
+        usize ring_index = (input_buffer->write + i - FFT_SIZE + input_buffer->length) % input_buffer->length;
         for (usize channel = 0; channel < channels; channel += 1) {
-            app->fft_input[i][channel] = *(f32*)PTR_ADD_BYTES(input_buffer->data, (ring_index*frame_size + channel*sample_size)) * app->analysis_window[i];
+            vocoder->fft_input[i][channel] = *(f32*)PTR_ADD_BYTES(input_buffer->data, (ring_index*frame_size + channel*sample_size)) * vocoder->analysis_window[i] * HOPS_PER_WINDOW;
         }
     }
 
-    fast_fourier_transform_c32(app->fft_size, dvc->capture.channels, app->fft_input, app->fft_output);
+    fast_fourier_transform_c32(FFT_SIZE, channels, vocoder->fft_input, vocoder->fft_output);
     
-    const usize analysis_bins_count = app->fft_size/2;
-    for (usize k = 0; k < analysis_bins_count; k += 1)
-    for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
-        f32 amplitude = mag_f32(app->fft_output[k][channel]);
-        f32 phase = phase_f32(app->fft_output[k][channel]);
-        f32 phase_delta = phase - app->last_input_phases[k][channel];
-        f32 bin_center_freq = 2.0f * pi* (f32)k/ (f32)app->fft_size;
-        phase_delta = wrap_f32(phase_delta - bin_center_freq*app->hop_size, -pi, pi);
-        f32 deviation = phase_delta * (f32)app->fft_size/(f32)app->hop_size / (2.0f * pi);
-        app->analysis_frequencies[k][channel] = (f32)k + deviation;
-        app->analysis_magnitudes[k][channel] = amplitude;
-        app->last_input_phases[k][channel] = phase;
+    for (usize k = 0; k < FFT_BINS; k += 1)
+    for (usize channel = 0; channel < channels; channel += 1) {
+        c32 wave = vocoder->fft_output[k][channel];
+        f32 amplitude = wave_mag_f32(wave);
+        f32 phase = wave_phase_f32(wave);
+        f32 phase_delta = phase - vocoder->last_input_phases[k][channel];
+        f32 bin_center_freq = 2.0f * pi* (f32)k/ (f32)FFT_SIZE;
+        phase_delta = wrap_f32(phase_delta - bin_center_freq*HOP_SIZE, -pi, pi);
+        f32 deviation = phase_delta * (f32)FFT_SIZE/(f32)HOP_SIZE / (2.0f * pi);
+        vocoder->analysis_frequencies[k][channel] = (f32)k + deviation;
+        vocoder->analysis_magnitudes[k][channel] = amplitude;
+        vocoder->last_input_phases[k][channel] = phase;
     }
+}
 
-    for (usize k = 0; k < analysis_bins_count; k += 1) 
-    for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
-        app->synthesis_magnitudes[k][channel] = app->synthesis_frequencies[k][channel] = 0;
-    }
+void phase_vocoder_synthesize(PhaseVocoder *vocoder) {
+    
+    const CflatRingBuffer *output_buffer = vocoder->output_buffer;
+    const usize frame_size = ma_get_bytes_per_frame(vocoder->format, vocoder->channels);
+    const usize sample_size = ma_get_bytes_per_sample(vocoder->format);
 
-    f32 pitch_shift = pitch_ratio_from_semitones_f32(app->pitch_shift_semitones);
-    for (usize k = 0; k < analysis_bins_count; k += 1) {
-        usize new_bin = round_nearest_int_f32(k * pitch_shift);
-        if (new_bin > analysis_bins_count) continue;
-        for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
-            app->synthesis_magnitudes[new_bin][channel] += app->analysis_magnitudes[k][channel];
-            app->synthesis_frequencies[new_bin][channel] = app->analysis_frequencies[k][channel] * pitch_shift;
-        }
-    }
-
-    for (usize k = 0; k < analysis_bins_count; k += 1) 
-    for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
-        f32 amplitude = app->synthesis_magnitudes[k][channel];
-        f32 deviation = app->synthesis_frequencies[k][channel] - k;
-        f32 phase_delta = deviation * (2.0f * pi) * (f32)app->hop_size/(f32)app->fft_size;
-        f32 bin_center_freq = 2.0f * pi * (f32)k/(f32)app->fft_size;
-        phase_delta += bin_center_freq * app->hop_size;
-        f32 out_phase = wrap_f32(app->last_output_phases[k][channel] + phase_delta, -pi, pi);
+    for (usize k = 0; k < FFT_BINS; k += 1) 
+    for (usize channel = 0; channel < vocoder->channels; channel += 1) {
+        f32 amplitude = vocoder->synthesis_magnitudes[k][channel];
+        f32 deviation = vocoder->synthesis_frequencies[k][channel] - k;
+        f32 phase_delta = deviation * (2.0f * pi) * HOPS_PER_WINDOW;
+        f32 bin_center_freq = 2.0f * pi * (f32)k/(f32)FFT_SIZE;
+        phase_delta += bin_center_freq * HOP_SIZE;
+        f32 out_phase = wrap_f32(vocoder->last_output_phases[k][channel] + phase_delta, -pi, pi);
         c32 out_freq = freq_f32(amplitude, out_phase);
-        app->fft_output[k][channel] = out_freq;
-        if (k > 0 && k < analysis_bins_count) {
-            app->fft_output[app->fft_size - k][channel] = conjf(out_freq);
+        vocoder->fft_output[k][channel] = out_freq;
+        if (k > 0 && k < FFT_BINS) {
+            vocoder->fft_output[FFT_SIZE - k][channel] = conjf(out_freq);
         }
-        app->last_output_phases[k][channel] = out_phase;
+        vocoder->last_output_phases[k][channel] = out_phase;
     }
     
-    inverse_fast_fourier_transform_c32(app->fft_size, dvc->capture.channels, app->fft_output, app->fft_input);
+    inverse_fast_fourier_transform_c32(FFT_SIZE, vocoder->channels, vocoder->fft_output, vocoder->fft_input);
     
-    for (usize i = 0; i < app->fft_size; i += 1)
+    for (usize i = 0; i < FFT_SIZE; i += 1)
     {
         usize ring_index = (output_buffer->write + i) % output_buffer->length;
-        for (usize channel = 0; channel < channels; channel += 1) {
-            *(f32*)PTR_ADD_BYTES(output_buffer->data, ring_index*frame_size + channel*sample_size) += app->fft_input[i][channel] * app->synthesis_window[i];
+        for (usize channel = 0; channel < vocoder->channels; channel += 1) {
+            *(f32*)PTR_ADD_BYTES(output_buffer->data, ring_index*frame_size + channel*sample_size) += vocoder->fft_input[i][channel] * vocoder->synthesis_window[i];
         }
     }
 }
 
-void data_callback(ma_device* dvc, void* out_buffer, const void* in_buffer, const ma_uint32 frames_count) {
-    cflat_assert(dvc->capture.format == ma_format_f32);
-    cflat_assert(dvc->playback.format == ma_format_f32);
-    cflat_assert(dvc->playback.channels == dvc->capture.channels);
+void phase_vocoder_reset_synthesis(PhaseVocoder *vocoder) {
+    for (usize k = 0; k < FFT_BINS; k += 1) 
+    for (usize channel = 0; channel < vocoder->channels; channel += 1) {
+        vocoder->synthesis_magnitudes[k][channel] = vocoder->synthesis_frequencies[k][channel] = 0;
+    }
+}
 
-    AppState *app = dvc->pUserData;
-    const usize frame_size = ma_get_bytes_per_frame(dvc->playback.format, dvc->playback.channels);
-    const usize sample_size = ma_get_bytes_per_sample(dvc->playback.format);
-    
+void phase_vocoder_pitch_shift(PhaseVocoder *vocoder, f32 semitones) {
+    const f32 ratio = pitch_ratio_from_semitones_f32(semitones);
+    for (usize k = 0; k < FFT_BINS; k += 1) {
+        const usize new_bin = round_nearest_int_f32(k * ratio);
+        if (new_bin > FFT_BINS) continue;
+
+        for (usize channel = 0; channel < vocoder->channels; channel += 1) {
+            vocoder->synthesis_magnitudes[new_bin][channel] += vocoder->analysis_magnitudes[k][channel];
+            vocoder->synthesis_frequencies[new_bin][channel] = vocoder->analysis_frequencies[k][channel] * ratio;
+        }
+    }
+}
+
+void phase_vocoder(PhaseVocoder *vocoder) {    
     static usize s_hop_counter = 0;
-    
-    //f32 hops_per_window = (f32)app->hop_size / (f32)app->fft_size;
-
-    for (usize i = 0; i < frames_count; i += 1) {
-        const void *in = PTR_ADD_BYTES(in_buffer, i*frame_size);
-        void *out = PTR_ADD_BYTES(out_buffer, i*frame_size);
-        
-        (ring_buffer_overwrite)(frame_size, app->input_buffer, in);
-        (ring_buffer_read)(frame_size, app->output_buffer, out, (RingBufferReadOpt) { .clear = true });
-
-        //for (usize channel = 0; channel < dvc->capture.channels; channel += 1) {
-        //    *(f32*)PTR_ADD_BYTES(out_buffer, i*frame_size + channel*sample_size) *= hops_per_window;
-        //}
-
-        if (++s_hop_counter >= app->hop_size) {
-            s_hop_counter = 0;
-            vocoder(dvc);
-            app->output_buffer->write = (app->output_buffer->write + app->hop_size) % app->output_buffer->length;
-        }
+    CflatRingBuffer *output_buffer = vocoder->output_buffer;
+    if (++s_hop_counter >= HOP_SIZE) {
+        s_hop_counter = 0;
+        phase_vocoder_analyse(vocoder);
+        phase_vocoder_reset_synthesis(vocoder);
+        phase_vocoder_pitch_shift(vocoder, 0);
+        phase_vocoder_synthesize(vocoder);
+        output_buffer->write = (output_buffer->write + HOP_SIZE) % output_buffer->length;
     }
-
-    apply_filters(dvc, out_buffer, frames_count);
 }
 
-void play_file_data_callback(ma_device* dvc, void* out, const void* in, const ma_uint32 frames_count) {
-    (void)in;
+void capture_vocoder(ma_device* dvc) {
     AppState *app = dvc->pUserData;
+    static usize s_hop_counter = 0;
+    CflatRingBuffer *output_buffer = app->capture_vocoder.output_buffer;
+    if (++s_hop_counter >= HOP_SIZE) {
+        s_hop_counter = 0;
+        phase_vocoder_analyse(&app->capture_vocoder);
+        phase_vocoder_reset_synthesis(&app->capture_vocoder);
+        phase_vocoder_pitch_shift(&app->capture_vocoder, app->pitch_shift_semitones);
+        phase_vocoder_synthesize(&app->capture_vocoder);
+        output_buffer->write = (output_buffer->write + HOP_SIZE) % output_buffer->length;
+    }
+}
+
+
+void app_poll_music_queue_f32(AppState *app, const ma_uint32 frames_count, const usize channels, f32 frames[frames_count][channels]) {
 
     if (app->music_queue->cursor >= slice_length(app->music_queue->playlist)) return;
     if (app->music_queue->playing == false) return;
@@ -270,6 +274,7 @@ void play_file_data_callback(ma_device* dvc, void* out, const void* in, const ma
     ma_data_converter *data_converter = &app->data_converter;
     ma_uint64 required_input_frames;
     ma_result result;
+    ma_device *dvc = &app->device;
     
     const usize output_frame_size = ma_get_bytes_per_frame(decoder->outputFormat, decoder->outputChannels);
     result = ma_data_converter_get_required_input_frame_count(data_converter, frames_count, &required_input_frames);
@@ -292,19 +297,51 @@ void play_file_data_callback(ma_device* dvc, void* out, const void* in, const ma
 
         music_file->cur_position += frames_read;
 
-        const usize playback_frame_size = ma_get_bytes_per_frame(dvc->playback.format, dvc->playback.channels);
+        const usize frame_size = ma_get_bytes_per_frame(dvc->playback.format, dvc->playback.channels);
 
-        f32 *converted_frames = arena_push(arena, frames_count*playback_frame_size, .clear = true);
-
+        f32 (*converted_frames)[frames_count][channels] = arena_push(arena, frames_count*frame_size, .clear = true);
         ma_uint64 frame_count_in = required_input_frames, frame_count_out = frames_count;
+        result = ma_data_converter_process_pcm_frames(data_converter, decoder_frames, &frame_count_in, (void*)converted_frames, &frame_count_out);
+        if (result != MA_SUCCESS) {
+            TRACE_ERROR("Couldn't convert frames, reason: %s\n", ma_result_description(result));
+            return;
+        }
         
-        result = ma_data_converter_process_pcm_frames(data_converter, decoder_frames, &frame_count_in, converted_frames, &frame_count_out);
-        result = ma_mix_pcm_frames_f32(out, converted_frames, frames_count, dvc->capture.channels, app->playback_volume * app->master_volume);
-
-        for (usize i = 0; i < max(frame_count_out, frames_count); i += 1) {
-            (ring_buffer_overwrite)(playback_frame_size, app->output_buffer, (byte*)out + i*playback_frame_size);
+        carray_scale_f32(frames_count*channels, (void*)converted_frames, app->music_volume);
+        for (usize i = 0; i < frame_count_out; i += 1) {
+            f32 out[channels];
+            ring_buffer_overwrite(app->music_queue_vocoder.input_buffer, frame_size, (*converted_frames)[i]);
+            ring_buffer_read(app->music_queue_vocoder.output_buffer, frame_size, out, .clear = true);
+            carray_add_f32(channels, &frames[i], &out);
+            phase_vocoder(&app->music_queue_vocoder);
         }
     }
+}
+
+void app_poll_capture_device_f32(AppState *app, const ma_uint32 frames_count, const usize channels, f32 out_buffer[frames_count][channels], const f32 in_buffer[frames_count][channels]) {
+    
+    ma_device *dvc = &app->device;
+    const usize frame_size = ma_get_bytes_per_frame(dvc->playback.format, dvc->playback.channels);
+
+    for (usize i = 0; i < frames_count; i += 1) {
+        ring_buffer_overwrite(app->capture_vocoder.input_buffer, frame_size, in_buffer[i]);
+        capture_filters(dvc, app->capture_vocoder.input_buffer->data + ((app->capture_vocoder.input_buffer->write-1)%app->capture_vocoder.input_buffer->length) *frame_size, 1);
+        f32 out[channels];
+        ring_buffer_read(app->capture_vocoder.output_buffer, frame_size, out, .clear = true);
+        carray_add_scaled_f32(channels, &out_buffer[i], &out, 1.0 / HOPS_PER_WINDOW);
+        capture_vocoder(dvc);
+    }
+}
+
+void data_callback(ma_device* dvc, void* out_buffer, const void* in_buffer, const ma_uint32 frames_count) {
+    cflat_assert(dvc->capture.format == ma_format_f32);
+    cflat_assert(dvc->playback.format == ma_format_f32);
+    cflat_assert(dvc->playback.channels == dvc->capture.channels);
+    AppState *app = dvc->pUserData;
+    
+    app_poll_music_queue_f32(app, frames_count, dvc->playback.channels, out_buffer);
+    app_poll_capture_device_f32(app, frames_count, dvc->capture.channels, out_buffer, in_buffer);
+    carray_scale_f32(frames_count * dvc->playback.channels, out_buffer, app->master_volume);
 }
 
 void cflat_sleep_msec(u32 milliseconds) {

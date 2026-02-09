@@ -25,7 +25,7 @@ cflat_export void *lib_new(Arena *arena, int argc, char **argv) {
     
     AppState *app = arena_push(arena, sizeof *app, .clear = true);
     app->master_volume = 1;
-    app->playback_volume = 1;
+    app->music_volume = 1;
     app->capture_volume = 1;
     app->arena = arena;
     app->data_converter_memory = arena_push(arena, KiB(1), .clear=true);
@@ -74,18 +74,27 @@ cflat_export void lib_enable(void *self) {
     app->device_config.playback.pDeviceID = NULL;
     app->device_config.capture.format = ma_format_f32;
     app->device_config.playback.format = ma_format_f32;
-    app->device_config.playback.channels = CAPTURE_CHANNELS;
-    app->device_config.capture.channels = CAPTURE_CHANNELS;
+    app->device_config.playback.channels = CHANNELS;
+    app->device_config.capture.channels = CHANNELS;
     app->device_config.sampleRate = CAPTURE_SAMPLE_RATE;
     app->device_config.dataCallback = data_callback;
     app->device_config.pUserData = app;
     app->bounds = (Rectangle) { .x = 0, .y = 0, .width = GetScreenWidth(), .height = GetScreenHeight() };
+    
+    static f32 s_hanning_window[FFT_SIZE];
+    hanning_window_f32(FFT_SIZE, s_hanning_window, WINDOW_CREATE);
 
-    app->fft_size = FFT_SIZE;
-    app->hop_size = HOP_SIZE;
+    app->music_queue_vocoder.format   = app->device_config.playback.format;
+    app->music_queue_vocoder.channels = app->device_config.playback.channels;
+    
+    mem_copy(app->music_queue_vocoder.analysis_window,  s_hanning_window, sizeof(s_hanning_window));
+    mem_copy(app->music_queue_vocoder.synthesis_window, s_hanning_window, sizeof(s_hanning_window));
+    
+    app->capture_vocoder.format    = app->device_config.capture.format;
+    app->capture_vocoder.channels  = app->device_config.capture.channels;
 
-    hanning_window_f32(FFT_SIZE, app->analysis_window, WINDOW_CREATE);
-    hanning_window_f32(FFT_SIZE, app->synthesis_window, WINDOW_CREATE);
+    mem_copy(app->capture_vocoder.analysis_window,   s_hanning_window, sizeof(s_hanning_window));
+    mem_copy(app->capture_vocoder.synthesis_window,  s_hanning_window, sizeof(s_hanning_window));
 
     result = ma_device_init(&app->context, &app->device_config, &app->device);
     
@@ -119,29 +128,37 @@ cflat_export void lib_enable(void *self) {
         ma_decoder_seek_to_pcm_frame(&app->decoder, music_file->cur_position);
     }
 
-    app->input_buffer = ring_buffer_new_opt(ma_get_bytes_per_frame(ma_format_f32, app->device.capture.channels), app->arena, KiB(16), (RingBufferNewOpt) {
-        .align = cflat_alignof(uptr),
+    const usize capture_frame_size = ma_get_bytes_per_frame(app->device.capture.format, app->device.capture.channels);
+
+    app->capture_vocoder.input_buffer = ring_buffer_new_opt(capture_frame_size, app->arena, KiB(16), (RingBufferNewOpt) {
+        .align = 64,
         .clear = true,
     });
 
-    cflat_assert(app->input_buffer != NULL);
+    app->capture_vocoder.output_buffer = ring_buffer_new_opt(capture_frame_size, app->arena, KiB(16), (RingBufferNewOpt) {
+        .align = 64,
+        .clear = true,
+    });
 
-    app->output_buffer = ring_buffer_new_opt(ma_get_bytes_per_frame(ma_format_f32, app->device.playback.channels), app->arena, KiB(16), (RingBufferNewOpt) {
-        .align = cflat_alignof(uptr),
+    const usize playback_frame_size = ma_get_bytes_per_frame(app->device.playback.format, app->device.playback.channels);
+    app->music_queue_vocoder.input_buffer = ring_buffer_new_opt(playback_frame_size, app->arena, KiB(16), (RingBufferNewOpt) {
+        .align = 64,
+        .clear = true,
+    });
+
+    app->music_queue_vocoder.output_buffer = ring_buffer_new_opt(playback_frame_size, app->arena, KiB(16), (RingBufferNewOpt) {
+        .align = 64,
         .clear = true,
     });
     
-    cflat_assert(app->output_buffer != NULL);
-
     // Widget Bounds
 
     app->w_frequency_spectrum = (WFrequencySpectrum) {
         .bounds = child_rect(app->bounds, .width = .75, .height = .75, .position.x = .25, .position.y = 0),
         .background_color = app->background_color,
-        .fft_size = app->fft_size,
-        .channels = CAPTURE_CHANNELS,
+        .fft_size = FFT_SIZE,
+        .channels = CHANNELS,
         .sample_rate = CAPTURE_SAMPLE_RATE,
-        .waves = app->smooth_waves,
         .lower_note = app->notes[NOTE_INDEX(C, -1)],
         .upper_note = app->notes[NOTE_INDEX(C, 10)],
     };
@@ -207,17 +224,19 @@ cflat_export void lib_update(void *self) {
     
     Arena *arena = app->arena;
     
-    c32 (*smooth_waves)[app->fft_size][CAPTURE_CHANNELS] = &app->smooth_waves;
-    c32 (*waves       )[app->fft_size][CAPTURE_CHANNELS] = &app->fft_output;
-    
+    c32 (*capture_waves)[FFT_SIZE][CHANNELS] = &app->capture_vocoder.fft_output;
+    c32 (*music_waves  )[FFT_SIZE][CHANNELS] = &app->music_queue_vocoder.fft_output;
+    c32 (*display_waves)[FFT_SIZE][CHANNELS] = &app->display_waves;
+
     TempArena eventloop_arena = arena_temp_begin(arena);
-    for (usize frame = 0; frame < CFLAT_ROW_SIZE(*waves); frame++)
-    for (usize channel = 0; channel < CFLAT_COL_SIZE(*waves); channel += 1) {
-        const f32 decay_constant = 12;
-        c32 wave        = (*waves)[frame][channel];
-        c32 smooth_wave = (*smooth_waves)[frame][channel];
-        smooth_wave = sexpdecay_c32(smooth_wave, wave, decay_constant, dt);
-        (*smooth_waves)[frame][channel] = smooth_wave;
+    for (usize frame = 0; frame < FFT_SIZE; frame++)
+    for (usize channel = 0; channel < CHANNELS; channel += 1) {
+        const f32 decay_constant = 25;
+        c32 music_wave    = (*music_waves)[frame][channel];
+        c32 capture_wave  = (*capture_waves)[frame][channel];
+        c32 display_wave  = (*display_waves)[frame][channel];
+        display_wave      = sexpdecay_c32(music_wave + capture_wave, display_wave, decay_constant, dt);
+        app->display_waves[frame][channel] = display_wave;
     }
 
     draw_frequencies(&app->w_frequency_spectrum);
@@ -360,7 +379,13 @@ bool draw_playlist_buttons(WPlaylistButtons *widget) {
         .direction.y = DOWN.y * 1.05,
     );
     
+    Vector2 mouse_pos = GetMousePosition();
+    bool right_click = IsMouseButtonPressed(MOUSE_RIGHT_BUTTON);
+
     GuiSlider(capture_volume_slider, "Capture Volume", NULL, &app->capture_volume, 0, 1);
+    if (right_click && CheckCollisionPointRec(mouse_pos, capture_volume_slider)) {
+        app->capture_volume = 0;
+    }
 
     Rectangle capture_gain = next_rect(
         capture_volume_slider,
@@ -400,9 +425,24 @@ bool draw_playlist_buttons(WPlaylistButtons *widget) {
     );
 
     GuiSlider(capture_gain, TextFormat("Gain: %.2f", app->capture_preamp_gain), NULL, &app->capture_preamp_gain, -20, 20);
+    if (right_click && CheckCollisionPointRec(mouse_pos, capture_gain)) {
+        app->capture_preamp_gain = 0;
+    }
+    
     GuiSlider(capture_low_pass_filter, TextFormat("Low Pass Filter: %.2f", app->capture_low_pass_filter_alpha), NULL, &app->capture_low_pass_filter_alpha, 0, 1);
+    if (right_click && CheckCollisionPointRec(mouse_pos, capture_low_pass_filter)) {
+        app->capture_low_pass_filter_alpha = 0;
+    }
+    
     GuiSlider(capture_high_pass_filter, TextFormat("High Pass Filter: %.2f", app->capture_high_pass_filter_alpha), NULL, &app->capture_high_pass_filter_alpha, 0, 1);
+    if (right_click && CheckCollisionPointRec(mouse_pos, capture_high_pass_filter)) {
+        app->capture_high_pass_filter_alpha = 0;
+    }
+    
     GuiSlider(pitch_shift_slider, "", NULL, &app->pitch_shift_semitones, -12, 12);
+    if (right_click && CheckCollisionPointRec(mouse_pos, pitch_shift_slider)) {
+        app->pitch_shift_semitones = 0;
+    }
 
     DrawText(TextFormat("Transpose: %.2f", app->pitch_shift_semitones), pitch_shift_label.x, pitch_shift_label.y, 10, GetColor(GuiGetStyle(TEXT, TEXT_COLOR_NORMAL)));
     if (GuiButton(dec_shift_button, "-")) {
@@ -430,7 +470,7 @@ bool draw_playlist_buttons(WPlaylistButtons *widget) {
         .direction = DOWN,
     );
 
-    GuiSlider(playback_volume_slider, "Playback", NULL, &app->playback_volume, 0, 1);
+    GuiSlider(playback_volume_slider, "Playback", NULL, &app->music_volume, 0, 1);
 
 
     Rectangle seconds_played_bounds = next_rect(
@@ -450,7 +490,6 @@ bool draw_playlist_buttons(WPlaylistButtons *widget) {
     bool up = IsKeyDown(KEY_RIGHT);
     bool down = IsKeyDown(KEY_LEFT);
 
-    Vector2 mouse_pos = GetMousePosition();
     if (CheckCollisionPointRec(mouse_pos, capture_gain)) {
         f32 step = up ? 1 : down ? -1 : 0;
         app->capture_preamp_gain = clamp_f32(app->capture_preamp_gain + step, -20, 20);
@@ -484,7 +523,7 @@ void draw_frequencies(WFrequencySpectrum *widget) {
     const f32 lower_note = widget->lower_note;
     const f32 upper_note = widget->upper_note;
 
-    c32 (*waves)[fft_size][channels] = widget->waves;
+    c32 (*waves)[fft_size][channels] = &app->display_waves;
 
     usize fft_resolution_in_notes = 0;
     for (usize bin = 1; bin <= fft_size/2; bin += 1) {
@@ -513,11 +552,11 @@ void draw_frequencies(WFrequencySpectrum *widget) {
             
             f32 next_freq = freq * app->note_step;
             
-            f32 db = spldB_f32((*waves)[bin][channel]);
+            f32 db = wave_spldB_f32((*waves)[bin][channel]);
             
             for (f32 hz = freq; hz < next_freq; hz = (f32)bin/fft_size*sample_rate) {
                 if (bin >= fft_size/2) break;
-                f32 db2 = spldB_f32((*waves)[bin++][channel]);
+                f32 db2 = wave_spldB_f32((*waves)[bin++][channel]);
                 db = fmaxf(db2, db);
             }
 

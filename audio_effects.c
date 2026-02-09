@@ -20,9 +20,16 @@ f32* carray_sum_c32f32(const usize size, f32 array[size], const c32 in[size]) {
     return array;
 }
 
-f32 carray_scale_f32(const usize size, f32 array[size], f32 scale) {
+void carray_scale_f32(const usize size, f32 array[size], f32 scale) {
     for (usize i = 0; i < size; i += 1) array[i] *= scale;
-    return scale;
+}
+
+void carray_add_f32(const usize size, f32 (*restrict out)[size], const f32 (*restrict in)[size]) {
+    for (usize i = 0; i < size; i += 1) (*out)[i] += (*in)[i];
+}
+
+void carray_add_scaled_f32(const usize size, f32 (*restrict out)[size], const f32 (*restrict in)[size], f32 scale) {
+    for (usize i = 0; i < size; i += 1) (*out)[i] += (*in)[i] * scale;
 }
 
 void carray_lowpass_filter_f32(usize frames, usize channels, f32 array[frames][channels], f32 alpha) {
@@ -93,23 +100,27 @@ c32 freq_f32(f32 mag, f32 phase) {
     return mag*cexpf(I*phase);
 }
 
-f32 spldB_f32(c32 wave) {
+f32 linear_to_dB_f32(f32 linear) {
+    return logf(linear) * 8.6858896380650365530225783783321f;
+}
+
+f32 dB_to_linear_f32(f32 dB) {
+    return expf(dB * 0.11512925464970228420089957273422f);
+}
+
+f32 wave_spldB_f32(c32 wave) {
     return 20.0f*log10f(cabsf(wave)/20e-6);
 }
 
-f32 dB_f32(c32 wave, f32 relative) {
+f32 wave_dB_f32(c32 wave, f32 relative) {
     return 20.0f*log10f(cabsf(wave)/relative);
 }
 
-f32 gain_to_volume_f32(f32 gain) {
-    return pow(10.0f, gain/20.0f);
-}
-
-f32 mag_f32(c32 wave) {
+f32 wave_mag_f32(c32 wave) {
     return cabsf(wave);
 }
 
-f32 phase_f32(c32 wave) {
+f32 wave_phase_f32(c32 wave) {
     return cargf(wave);
 }
 
