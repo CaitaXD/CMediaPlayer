@@ -231,7 +231,7 @@ cflat_export void lib_update(void *self) {
     TempArena eventloop_arena = arena_temp_begin(arena);
     for (usize frame = 0; frame < FFT_SIZE; frame++)
     for (usize channel = 0; channel < CHANNELS; channel += 1) {
-        const f32 decay_constant = 25;
+        const f32 decay_constant = 16;
         c32 music_wave    = (*music_waves)[frame][channel];
         c32 capture_wave  = (*capture_waves)[frame][channel];
         c32 display_wave  = (*display_waves)[frame][channel];

@@ -324,8 +324,10 @@ void app_poll_capture_device_f32(AppState *app, const ma_uint32 frames_count, co
     const usize frame_size = ma_get_bytes_per_frame(dvc->playback.format, dvc->playback.channels);
 
     for (usize i = 0; i < frames_count; i += 1) {
+        void *top = app->capture_vocoder.input_buffer->data + app->capture_vocoder.input_buffer->write*frame_size;
         ring_buffer_overwrite(app->capture_vocoder.input_buffer, frame_size, in_buffer[i]);
-        capture_filters(dvc, app->capture_vocoder.input_buffer->data + ((app->capture_vocoder.input_buffer->write-1)%app->capture_vocoder.input_buffer->length) *frame_size, 1);
+        capture_filters(dvc, top, 1);
+        
         f32 out[channels];
         ring_buffer_read(app->capture_vocoder.output_buffer, frame_size, out, .clear = true);
         carray_add_scaled_f32(channels, &out_buffer[i], &out, 1.0 / HOPS_PER_WINDOW);
