@@ -103,20 +103,39 @@ c32 freq_f32(f32 mag, f32 phase) {
     return mag*cexpf(I*phase);
 }
 
+#define TWENTY_OVER_LN_10 (8.6858896380650365530225783783321016458879401160733313222890756633) // 20/ln(10)
+#define LN_10_OVER_TWENTY (0.1151292546497022842008995727342182103800550744314386488016663950) // ln(10)/20
+#define SPL_OFFSET        (93.979400086720376095725222105510139464636202370757829173791450777) // 20*log10(1/20e-6)
+#define LN_2_OVER_12      (0.0577622650466621091181026767881813806729583445300212711767233341) // ln(2)/12
+#define AUDIO_EPSILON     (1e-12f)                                                             
+
 f32 linear_to_dB_f32(f32 linear) {
-    return logf(linear) * 8.6858896380650365530225783783321f;
+    linear = fmaxf(linear, AUDIO_EPSILON);
+    return logf(linear)*TWENTY_OVER_LN_10;                  // 20*log10(linear)
+}
+
+f32 linear_to_spldB_f32(f32 linear) {
+    linear = fmaxf(linear, AUDIO_EPSILON);
+    return logf(linear)*TWENTY_OVER_LN_10 + SPL_OFFSET;     // 20*log10(linear/20e-6)
 }
 
 f32 dB_to_linear_f32(f32 dB) {
-    return expf(dB * 0.11512925464970228420089957273422f);
+    return expf(dB*LN_10_OVER_TWENTY);                      // pow(10, dB/20)
 }
 
 f32 wave_spldB_f32(c32 wave) {
-    return 20.0f*log10f(cabsf(wave)/20e-6);
+    f32 linear = fmaxf(cabsf(wave), AUDIO_EPSILON);
+    return logf(linear)*TWENTY_OVER_LN_10 + SPL_OFFSET;     // 20*log10(||wave||/20e-6)
 }
 
 f32 wave_dB_f32(c32 wave, f32 relative) {
-    return 20.0f*log10f(cabsf(wave)/relative);
+    f32 linear = fmaxf(cabsf(wave), AUDIO_EPSILON);
+    relative = fmaxf(relative, AUDIO_EPSILON);
+    return logf(linear/relative)*TWENTY_OVER_LN_10;         // 20*log10(||wave||/relative)
+}
+
+f32 pitch_ratio_from_semitones_f32(f32 semitones) {
+    return expf(semitones * LN_2_OVER_12);                  // pow(2, semitones/12)
 }
 
 f32 wave_mag_f32(c32 wave) {
@@ -129,10 +148,6 @@ f32 wave_phase_f32(c32 wave) {
 
 f32 round_nearest_int_f32(f32 x) {
     return floorf(x + 0.5f);
-}
-
-f32 pitch_ratio_from_semitones_f32(f32 semitones) {
-    return powf(2.0f, semitones/12.0f);
 }
 
 f32 wrap_2pi_f32(f32 x) {
