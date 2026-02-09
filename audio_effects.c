@@ -164,15 +164,3 @@ f32 wrap_f32(f32 x, f32 low, f32 high) {
     const f32 num_wraps = floorf((x - low) * inv_range);
     return x - range * num_wraps;
 }
-
-void copy_apply_lowpass_filter_f32(usize frames, usize channels, f32 out[frames][channels], const f32 in[frames][channels], f32 alpha) {
-    for (usize channel = 0; channel < channels; channel += 1)
-        out[0][channel] = alpha * in[0][channel];
-    
-    for (usize i = 1; i < frames; i += 1)
-    for (usize channel = 0; channel < channels; channel += 1) {
-        f32 x   = in[i][channel];
-        f32 ym1 = out[i-1][channel];
-        out[i][channel] = ym1 + alpha * (x - ym1);
-    }
-}
