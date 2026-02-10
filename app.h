@@ -171,7 +171,7 @@ void phase_vocoder_analyse(PhaseVocoder *vocoder) {
         }
     }
 
-    fast_fourier_transform_c32(FFT_SIZE, channels, vocoder->fft_input, vocoder->fft_output);
+    fast_fourier_transform_c32(FFT_SIZE, channels, (void*)vocoder->fft_input, (void*)vocoder->fft_output);
     
     for (usize k = 0; k < FFT_BINS; k += 1)
     for (usize channel = 0; channel < channels; channel += 1) {
@@ -210,7 +210,7 @@ void phase_vocoder_synthesize(PhaseVocoder *vocoder) {
         vocoder->last_output_phases[k][channel] = out_phase;
     }
     
-    inverse_fast_fourier_transform_c32(FFT_SIZE, vocoder->channels, vocoder->fft_output, vocoder->fft_input);
+    inverse_fast_fourier_transform_c32(FFT_SIZE, vocoder->channels, (void*)vocoder->fft_output, (void*)vocoder->fft_input);
     
     for (usize i = 0; i < FFT_SIZE; i += 1)
     {
@@ -272,7 +272,10 @@ void capture_vocoder(ma_device* dvc) {
 void app_poll_music_queue_f32(AppState *app, const ma_uint32 frames_count, const usize channels, f32 frames[frames_count][channels]) {
 
     if (app->music_queue->cursor >= slice_length(app->music_queue->playlist)) return;
-    if (app->music_queue->playing == false) return;
+    if (app->music_queue->playing == false) {
+        mem_zero(app->music_queue_vocoder.fft_output, sizeof(app->music_queue_vocoder.fft_output));
+        return;
+    }
 
     MusicFile *music_file = &slice_data(app->music_queue->playlist)[app->music_queue->cursor];
     ma_decoder* decoder = &app->decoder;
