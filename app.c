@@ -31,8 +31,9 @@ cflat_export void *lib_new(Arena *arena, int argc, char **argv) {
     app->data_converter_memory = arena_push(arena, KiB(1), .clear=true);
     app->music_queue = music_queue_new(app->arena);
     app->music_queue->playing = true;
-    app->capture_low_pass_filter_alpha = 0.75;
-    app->capture_high_pass_filter_alpha = 0.75;
+
+    app->capture_filters.high_pass_filter = (HighPassFilter) { .alpha=.75f };
+    app->capture_filters.low_pass_filters = (LowPassFilter) { .alpha=.75f };
 
     app->note_step = exp2(1.0/12.0); 
     app->notes[0] = 8.176;
@@ -84,15 +85,8 @@ cflat_export void lib_enable(void *self) {
     static f32 s_hanning_window[FFT_SIZE];
     hanning_window_f32(FFT_SIZE, s_hanning_window, WINDOW_CREATE);
 
-    app->music_queue_vocoder.format   = app->device_config.playback.format;
-    app->music_queue_vocoder.channels = app->device_config.playback.channels;
-    
     mem_copy(app->music_queue_vocoder.analysis_window,  s_hanning_window, sizeof(s_hanning_window));
     mem_copy(app->music_queue_vocoder.synthesis_window, s_hanning_window, sizeof(s_hanning_window));
-    
-    app->capture_vocoder.format    = app->device_config.capture.format;
-    app->capture_vocoder.channels  = app->device_config.capture.channels;
-
     mem_copy(app->capture_vocoder.analysis_window,   s_hanning_window, sizeof(s_hanning_window));
     mem_copy(app->capture_vocoder.synthesis_window,  s_hanning_window, sizeof(s_hanning_window));
 
@@ -127,32 +121,15 @@ cflat_export void lib_enable(void *self) {
 
         ma_decoder_seek_to_pcm_frame(&app->decoder, music_file->cur_position);
     }
-
-    const usize capture_frame_size = ma_get_bytes_per_frame(app->device.capture.format, app->device.capture.channels);
-
-    app->capture_vocoder.input_buffer = ring_buffer_new_opt(capture_frame_size, app->arena, KiB(16), (RingBufferNewOpt) {
-        .align = 64,
-        .clear = true,
-    });
-
-    app->capture_vocoder.output_buffer = ring_buffer_new_opt(capture_frame_size, app->arena, KiB(16), (RingBufferNewOpt) {
-        .align = 64,
-        .clear = true,
-    });
-
-    const usize playback_frame_size = ma_get_bytes_per_frame(app->device.playback.format, app->device.playback.channels);
-    app->music_queue_vocoder.input_buffer = ring_buffer_new_opt(playback_frame_size, app->arena, KiB(16), (RingBufferNewOpt) {
-        .align = 64,
-        .clear = true,
-    });
-
-    app->music_queue_vocoder.output_buffer = ring_buffer_new_opt(playback_frame_size, app->arena, KiB(16), (RingBufferNewOpt) {
-        .align = 64,
-        .clear = true,
-    });
+    
+    app->capture_vocoder.input_buffer.length      = ARRAY_SIZE(app->capture_vocoder.input_buffer.data);
+    app->capture_vocoder.output_buffer.length     = ARRAY_SIZE(app->capture_vocoder.output_buffer.data);
+    app->music_queue_vocoder.input_buffer.length  = ARRAY_SIZE(app->music_queue_vocoder.input_buffer.data);
+    app->music_queue_vocoder.output_buffer.length = ARRAY_SIZE(app->music_queue_vocoder.output_buffer.data);
+    app->music_queue_vocoder.pitch_ratio  = 1;
+    app->music_queue_vocoder.time_stretch = 1;
     
     // Widget Bounds
-
     app->w_frequency_spectrum = (WFrequencySpectrum) {
         .bounds = child_rect(app->bounds, .width = .75, .height = .75, .position.x = .25, .position.y = 0),
         .background_color = app->background_color,
@@ -224,19 +201,19 @@ cflat_export void lib_update(void *self) {
     
     Arena *arena = app->arena;
     
-    c32 (*capture_waves)[FFT_SIZE][CHANNELS] = &app->capture_vocoder.fft_output;
-    c32 (*music_waves  )[FFT_SIZE][CHANNELS] = &app->music_queue_vocoder.fft_output;
-    c32 (*display_waves)[FFT_SIZE][CHANNELS] = &app->display_waves;
+    c32 (*capture_waves)[CHANNELS][FFT_SIZE] = &app->capture_vocoder.fft_output;
+    c32 (*music_waves  )[CHANNELS][FFT_SIZE] = &app->music_queue_vocoder.fft_output;
+    c32 (*display_waves)[CHANNELS][FFT_SIZE] = &app->display_waves;
 
     TempArena eventloop_arena = arena_temp_begin(arena);
-    for (usize frame = 0; frame < FFT_SIZE; frame++)
-    for (usize channel = 0; channel < CHANNELS; channel += 1) {
+    for (usize channel = 0; channel < CHANNELS; channel += 1) 
+    for (usize frame = 0; frame < FFT_SIZE; frame++) {
         const f32 decay_constant = 6;
-        c32 music_wave    = (*music_waves)[frame][channel];
-        c32 capture_wave  = (*capture_waves)[frame][channel];
-        c32 display_wave  = (*display_waves)[frame][channel];
-        display_wave      = sexpdecay_c32(display_wave, music_wave + capture_wave, decay_constant, dt);
-        app->display_waves[frame][channel] = display_wave;
+        c32 music_wave    = (*music_waves)[channel][frame];
+        c32 capture_wave  = (*capture_waves)[channel][frame];
+        c32 display_wave  = (*display_waves)[channel][frame];
+        display_wave      = cflat_sexpdecay_c32(display_wave, music_wave + capture_wave, decay_constant, dt);
+        app->display_waves[channel][frame] = display_wave;
     }
 
     draw_frequencies(&app->w_frequency_spectrum);
@@ -429,14 +406,14 @@ bool draw_playlist_buttons(WPlaylistButtons *widget) {
         app->capture_preamp_gain = 0;
     }
     
-    GuiSlider(capture_low_pass_filter, TextFormat("Low Pass Filter: %.2f", app->capture_low_pass_filter_alpha), NULL, &app->capture_low_pass_filter_alpha, 0, 1);
+    GuiSlider(capture_low_pass_filter, TextFormat("Low Pass Filter: %.2f", app->capture_filters.low_pass_filters.alpha), NULL, &app->capture_filters.low_pass_filters.alpha, 0, 1);
     if (right_click && CheckCollisionPointRec(mouse_pos, capture_low_pass_filter)) {
-        app->capture_low_pass_filter_alpha = 0;
+        app->capture_filters.low_pass_filters.alpha = 0;
     }
     
-    GuiSlider(capture_high_pass_filter, TextFormat("High Pass Filter: %.2f", app->capture_high_pass_filter_alpha), NULL, &app->capture_high_pass_filter_alpha, 0, 1);
+    GuiSlider(capture_high_pass_filter, TextFormat("High Pass Filter: %.2f", app->capture_filters.high_pass_filter.alpha), NULL, &app->capture_filters.high_pass_filter.alpha, 0, 1);
     if (right_click && CheckCollisionPointRec(mouse_pos, capture_high_pass_filter)) {
-        app->capture_high_pass_filter_alpha = 0;
+        app->capture_filters.high_pass_filter.alpha = 0;
     }
     
     GuiSlider(pitch_shift_slider, "", NULL, &app->pitch_shift_semitones, -12, 12);
@@ -492,15 +469,15 @@ bool draw_playlist_buttons(WPlaylistButtons *widget) {
 
     if (CheckCollisionPointRec(mouse_pos, capture_gain)) {
         f32 step = up ? 1 : down ? -1 : 0;
-        app->capture_preamp_gain = clamp_f32(app->capture_preamp_gain + step, -20, 20);
+        app->capture_preamp_gain = cflat_clamp_f32(app->capture_preamp_gain + step, -20, 20);
     }
     if (CheckCollisionPointRec(mouse_pos, capture_low_pass_filter)) {
         f32 step = up ? 0.01 : down ? -0.01 : 0;
-        app->capture_low_pass_filter_alpha = clamp_f32(app->capture_low_pass_filter_alpha + step, 0, 1);
+        app->capture_filters.low_pass_filters.alpha = cflat_clamp_f32(app->capture_filters.low_pass_filters.alpha + step, 0, 1);
     }
     if (CheckCollisionPointRec(mouse_pos, capture_high_pass_filter)) {
         f32 step = up ? 0.01 : down ? -0.01 : 0;
-        app->capture_high_pass_filter_alpha = clamp_f32(app->capture_high_pass_filter_alpha + step, 0, 1);
+        app->capture_filters.high_pass_filter.alpha = cflat_clamp_f32(app->capture_filters.high_pass_filter.alpha + step, 0, 1);
     }
 
     return interacted;
@@ -523,7 +500,7 @@ void draw_frequencies(WFrequencySpectrum *widget) {
     const f32 lower_note = widget->lower_note;
     const f32 upper_note = widget->upper_note;
 
-    c32 (*waves)[fft_size][channels] = &app->display_waves;
+    c32 (*waves)[channels][fft_size] = &app->display_waves;
 
     usize fft_resolution_in_notes = 0;
     for (usize bin = 1; bin <= fft_size/2; bin += 1) {
@@ -552,21 +529,21 @@ void draw_frequencies(WFrequencySpectrum *widget) {
             
             f32 next_freq = freq * app->note_step;
             
-            f32 db = wave_spldB_f32((*waves)[bin][channel]);
+            f32 db = wave_spldB_f32((*waves)[channel][bin]);
             
             for (f32 hz = freq; hz < next_freq; hz = (f32)bin/fft_size*sample_rate) {
                 if (bin >= fft_size/2) break;
-                f32 db2 = wave_spldB_f32((*waves)[bin++][channel]);
+                f32 db2 = wave_spldB_f32((*waves)[channel][bin++]);
                 db = fmaxf(db2, db);
             }
 
-            f32 t = clamp_f32(ilerp_f32(10, 130, db), 0, 1);
+            f32 t = cflat_clamp_f32(cflat_ilerp_f32(10, 130, db), 0, 1);
             f32 bin_height = (height/channels) * t;
             f32 bin_y      = height + y - bin_height - channel_offset;
             f32 bin_x      = x + (index++)*bin_width;
             
             for (usize i = bin_y; i < bin_y + bin_height; i += 1) {
-                f32 t2 = ilerp_f32(bin_y, bin_y + bin_height, i);
+                f32 t2 = cflat_ilerp_f32(bin_y, bin_y + bin_height, i);
                 
                 Color base = ColorLerp(YELLOW, RED, 1-t);
                 Color tip = ColorLerp(MAGENTA, RED, .5f);

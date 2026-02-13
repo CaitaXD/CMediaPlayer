@@ -15,5 +15,6 @@ CompileFlags:
     -Ivendor/raylib/raylib-5.5_win64_mingw-w64/include,
     -Ivendor/raygui-4.0/src,
     -Wno-empty-translation-unit,
-    -DRUNNER_IMPLEMENTATION
+    -DRUNNER_IMPLEMENTATION,
+    -mavx
   ]

@@ -1,3 +1,5 @@
+#if !defined(AUDIO_EFFECTS_H)
+#define AUDIO_EFFECTS_H
 
 #include "vendor/Cflat/src/CflatCore.h"
 #include "vendor/Cflat/src/CflatMath.h"
@@ -8,7 +10,6 @@ cflat_enum(WindowingOption, u8) {
     WINDOW_INPLACE         = 0,
     WINDOW_CREATE          = 1,
 };
-
 
 c32* carray_copy_f32_to_c32(const usize size, c32 array[size], const f32 in[size]) {
     for (usize i = 0; i < size; i += 1) array[i] = in[i];
@@ -32,37 +33,50 @@ void carray_add_scaled_f32(const usize size, f32 (*restrict out)[size], const f3
     for (usize i = 0; i < size; i += 1) (*out)[i] += (*in)[i] * scale;
 }
 
-void carray_lowpass_filter_f32(usize frames, usize channels, f32 out[frames][channels], f32 alpha, f32 prev_out[channels]) {
-    for (usize channel = 0; channel < channels; channel += 1) out[0][channel] = alpha * out[0][channel];
+typedef struct low_pass_filter {
+    f32 alpha;
+    f32 ym1;
+} LowPassFilter;
+
+typedef struct high_pass_filter {
+    f32 alpha;
+    f32 xm1;
+    f32 ym1;
+} HighPassFilter;
+
+void interleaved_lowpass_filter_f32(usize frames, usize channels, f32 out[frames][channels], LowPassFilter *filters[channels]) {
+    for (usize channel = 0; channel < channels; channel += 1) out[0][channel] = filters[channel]->alpha * out[0][channel];
     
     for (usize i = 0; i < frames; i += 1)
     for (usize c = 0; c < channels; c += 1) {
+        LowPassFilter *filter = filters[c];
         f32 x   = out[i][c];
-        f32 ym1 = prev_out[c];
-        prev_out[c] = out[i][c] = ym1 + alpha * (x - ym1);
+        f32 ym1 = filter->ym1;
+        filter->ym1 = out[i][c] = ym1 + filter->alpha * (x - ym1);
     }
 }
 
-void carray_highpass_filter_f32(usize frames, usize channels, f32 out[frames][channels], f32 alpha, f32 prev_in[channels], f32 prev_out[channels]) {
+void interleaved_highpass_filter_f32(usize frames, usize channels, f32 out[frames][channels], HighPassFilter *filters[channels]) {
 
     for (usize i = 0; i < frames; i += 1)
     for (usize c = 0; c < channels; c += 1) {
+        HighPassFilter *filter = filters[c];
         f32 x   = out[i][c];
-        f32 xm1 = prev_in[c];
-        f32 ym1 = prev_out[c];
-        f32 y = alpha * (ym1 + x - xm1);
-        prev_in[c] = x;
-        prev_out[c] = out[i][c] = y;
+        f32 xm1 = filter->xm1;
+        f32 ym1 = filter->ym1;
+        f32 y = filter->alpha * (ym1 + x - xm1);
+        filter->xm1 = x;
+        filter->ym1 = out[i][c] = y;
     }
 }
 
-void carray_window_f32(usize frames, usize channels, f32 (*restrict array)[frames][channels], f32 *restrict window) {
+void interleaved_window_f32(usize frames, usize channels, f32 (*restrict array)[frames][channels], f32 *restrict window) {
     for (usize i = 0; i < frames; i += 1) 
     for (usize channel = 0; channel < channels; channel += 1) 
         (*array)[i][channel] *= window[i];
 }
 
-void carray_window_c32(usize frames, usize channels, c32 (*restrict array)[frames][channels], f32 *restrict window) {
+void interleaved_window_c32(usize frames, usize channels, c32 (*restrict array)[frames][channels], f32 *restrict window) {
     for (usize i = 0; i < frames; i += 1) 
     for (usize channel = 0; channel < channels; channel += 1) 
         (*array)[i][channel] *= window[i];
@@ -164,3 +178,5 @@ f32 wrap_f32(f32 x, f32 low, f32 high) {
     const f32 num_wraps = floorf((x - low) * inv_range);
     return x - range * num_wraps;
 }
+
+#endif //AUDIO_EFFECTS_H
